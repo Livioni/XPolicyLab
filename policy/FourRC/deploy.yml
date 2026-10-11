@@ -1,0 +1,33 @@
+policy_name: FourRC
+protocol: ws
+host: localhost
+port: null
+bench_name: null
+task_name: null
+ckpt_name: null
+env_cfg_type: arx_x5
+seed: 0
+action_type: ee
+gpu_id: null
+eval_batch: false
+fourrc_root: null
+# Override training-machine paths such as datasets/t5-base-local in checkpoints.
+t5_model: google-t5/t5-base
+device: auto
+dtype: auto
+sampling_steps: 8
+
+# Number of predicted actions executed before replanning (1..16).
+execute_horizon: 8
+
+# Live point cloud + predicted/actual TCP display on the policy-server host.
+viser: false
+viser_host: 127.0.0.1
+viser_port: 8020
+viser_max_points: 100000
+viser_max_windows: 128
+# One click permits one inference + its execution chunk. Disable for automatic runs.
+viser_manual: true
+# Keep every Nth valid point after filtering (2 -> about 1/2 of the points).
+viser_downsample: 2
+viser_point_size: 0.003
