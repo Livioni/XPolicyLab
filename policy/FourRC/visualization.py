@@ -62,11 +62,12 @@ def scene_record(frames, prediction, base_tcp, make_point_cloud, *, max_points,
     original RGB/intrinsics. Historical TCPs each belong to their own camera.
     Downsample counts filtered points: 2 retains every second valid point.
     """
+    history_frames = len(frames)
     anchor = frames[-1]
     depth = np.asarray(prediction["depth"])
     confidence = np.asarray(prediction["depth_confidence"])
-    if depth.shape != (8, 252, 322) or confidence.shape != depth.shape:
-        raise ValueError("Viser expects 4RC depth/confidence [8,252,322]")
+    if depth.shape != (history_frames, 252, 322) or confidence.shape != depth.shape:
+        raise ValueError(f"Viser expects 4RC depth/confidence [{history_frames},252,322]")
     if isinstance(downsample, bool) or not isinstance(downsample, int) or downsample < 1:
         raise ValueError("Viser downsample must be a positive integer")
     camera_to_world = np.linalg.inv(np.stack([frame["cw"] for frame in frames]))
@@ -79,10 +80,10 @@ def scene_record(frames, prediction, base_tcp, make_point_cloud, *, max_points,
             confidence[local, 6:246, 1:321],
             frame["rgb"], frame["k"],
             frame["cw"], np.eye(4), confidence_percentile=2.5,
-            max_points=0, max_depth=3.0, seed=window * 8 + local)
+            max_points=0, max_depth=3.0, seed=window * history_frames + local)
         points, colors = points[::downsample], colors[::downsample]
         if max_points and len(points) > max_points:
-            indices = np.random.default_rng(window * 8 + local).choice(len(points), max_points, replace=False)
+            indices = np.random.default_rng(window * history_frames + local).choice(len(points), max_points, replace=False)
             points, colors = points[indices], colors[indices]
         points, colors = points.copy(), colors.copy()
         clouds.append(dict(points=points, colors=colors, rgb=frame["rgb"],
@@ -91,8 +92,8 @@ def scene_record(frames, prediction, base_tcp, make_point_cloud, *, max_points,
     recovered = np.einsum("tij,taj->tai", camera_to_world[:, :3, :3],
                           prediction["history_position"]) + camera_to_world[:, None, :3, 3]
     valid = np.asarray(prediction["history_valid"], dtype=bool)
-    if valid.shape != (8, 2):
-        raise ValueError("Viser expects history_valid [8,2]")
+    if valid.shape != (history_frames, 2):
+        raise ValueError(f"Viser expects history_valid [{history_frames},2]")
     recovered[~valid] = np.nan
     measured = np.stack([frame["wb"] @ frame["tcp_base"] for frame in frames])
     return dict(case=dict(case), instruction=instruction, window=window,
@@ -115,11 +116,11 @@ def _boolean(value, name):
     return bool(value)
 
 
-def create_viewer(config, make_point_cloud):
+def create_viewer(config, make_point_cloud, *, history_frames, prediction_horizon):
     if not _boolean(os.environ.get("FOURRC_VISER", config.get("viser", False)), "FOURRC_VISER"):
         return None
     return LiveViewer(
-        make_point_cloud,
+        make_point_cloud, history_frames=history_frames, prediction_horizon=prediction_horizon,
         host=os.environ.get("FOURRC_VISER_HOST", config.get("viser_host", "127.0.0.1")),
         port=int(os.environ.get("FOURRC_VISER_PORT", config.get("viser_port", 8020))),
         max_points=int(config.get("viser_max_points", 100000)),
@@ -130,7 +131,7 @@ def create_viewer(config, make_point_cloud):
 
 
 class LiveViewer:
-    def __init__(self, make_point_cloud, *, host="127.0.0.1", port=8020,
+    def __init__(self, make_point_cloud, *, history_frames, prediction_horizon, host="127.0.0.1", port=8020,
                  max_points=100000, max_windows=128, manual=True, downsample=2, point_size=0.003):
         if (not host or not 1 <= port <= 65535 or max_points < 1 or max_windows < 1
                 or isinstance(downsample, bool) or not isinstance(downsample, int) or downsample < 1
@@ -140,6 +141,8 @@ class LiveViewer:
             import viser
         except ImportError as exc:
             raise RuntimeError("Install viser in the policy environment: pip install 'viser>=1.1,<2'") from exc
+        self.history_frames = history_frames
+        self.prediction_horizon = prediction_horizon
         self.make_point_cloud = make_point_cloud
         self.max_points = max_points
         self.manual = manual
@@ -157,16 +160,17 @@ class LiveViewer:
         with gui.add_folder("推理控制"):
             self.run_button = gui.add_button("推理并执行一次", disabled=True, color="blue")
             self.control_status = gui.add_markdown("等待环境准备…" if manual else "自动推理模式")
-            gui.add_markdown("每次点击：推理 16 步 → 更新场景 → 执行前 N 步 → 等待下次点击。")
+            gui.add_markdown(f"每次点击：推理 {prediction_horizon} 步 → 更新场景 → 执行前 N 步 → 等待下次点击。")
         with gui.add_folder("历史窗口与帧"):
             self.follow = gui.add_checkbox("Follow latest", True)
             self.window = gui.add_slider("Window", min=0, max=1, step=1, initial_value=0, disabled=True)
-            self.history_frame = gui.add_slider("历史帧 (0–7)", min=0, max=7, step=1,
-                                                initial_value=7, disabled=True)
+            self.history_frame = gui.add_slider(f"历史帧 (0–{history_frames - 1})", min=0, max=max(1, history_frames - 1), step=1,
+                                                initial_value=history_frames - 1, disabled=True)
             with gui.add_folder("逐帧浏览", expand_by_default=True):
                 previous_frame = gui.add_button("上一帧")
                 next_frame = gui.add_button("下一帧")
-            self.step = gui.add_slider("Future step", min=1, max=16, step=1, initial_value=16)
+            self.step = gui.add_slider("Future step", min=1, max=max(2, prediction_horizon), step=1,
+                                       initial_value=prediction_horizon, disabled=prediction_horizon == 1)
             camera_button = gui.add_button("Third-camera view")
         with gui.add_folder("Geometry / TCP"):
             self.cloud = gui.add_checkbox("Reconstructed point cloud", True)
@@ -239,7 +243,7 @@ class LiveViewer:
         with self._lock:
             if self.records:
                 self.follow.value = False
-                self.history_frame.value = max(0, min(7, self.history_frame.value + direction))
+                self.history_frame.value = max(0, min(self.history_frames - 1, self.history_frame.value + direction))
 
     def _selected(self):
         return next((record for record in self.records if record["window"] == self.window.value), None)
@@ -256,7 +260,7 @@ class LiveViewer:
             try:
                 self.window.min, self.window.max, self.window.value = 0, 1, 0
                 self.window.disabled = True
-                self.history_frame.value = 7
+                self.history_frame.value = self.history_frames - 1
                 self.history_frame.disabled = True
                 self.follow.value = True
             finally:
@@ -273,7 +277,7 @@ class LiveViewer:
             self.records.append(record)
             self._phase = "executing"
             self.control_status.content = f"**推理完成，执行前 {execute_horizon} 步…**"
-            self.history_frame.disabled = False
+            self.history_frame.disabled = self.history_frames == 1
             self._syncing = True
             try:
                 self.window.max = max(1, record["window"])
@@ -281,7 +285,7 @@ class LiveViewer:
                 self.window.disabled = len(self.records) == 1
                 if self.follow.value or self.window.value < self.window.min:
                     self.window.value = record["window"] if self.follow.value else self.window.min
-                    self.history_frame.value = 7
+                    self.history_frame.value = self.history_frames - 1
             finally:
                 self._syncing = False
             self.refresh()
@@ -332,7 +336,7 @@ class LiveViewer:
                 self.follow.value = False
             self._syncing = True
             try:
-                self.history_frame.value = 7
+                self.history_frame.value = self.history_frames - 1
             finally:
                 self._syncing = False
             self.refresh()
@@ -382,10 +386,10 @@ class LiveViewer:
                     self._frame(f"/actual_axes/{arm}", poses[-1, arm], self._actual_nodes)
 
     def _update_info(self, record):
-        step = int(self.step.value)
+        step = min(int(self.step.value), self.prediction_horizon)
         case = record["case"]
         grip = record["gripper"][step - 1]
-        selected_cloud = record["clouds"][int(self.history_frame.value)]
+        selected_cloud = record["clouds"][min(int(self.history_frame.value), self.history_frames - 1)]
         status = "running" if record["result"] is None else ("success" if record["result"].get("success") else "failed")
         self.info.content = (
             f"**{case.get('task_name', 'episode')} · seed {case.get('seed', '?')} · {status}**\n\n"
@@ -395,7 +399,7 @@ class LiveViewer:
             f"**{selected_cloud['index']}**；"
             f"有效点按 **1/{record['downsample']}** 抽样，当前 **{len(selected_cloud['points']):,}** 点。"
             f"未来轨迹属于窗口末帧。\n\n"
-            f"Predict **16**, execute **{record['execute_horizon']}**; "
+            f"Predict **{len(record['future'])}**, execute **{record['execute_horizon']}**; "
             f"received **{len(record['executed']) - 1}** post-action observations.\n\n"
             f"Selected future **+{step}** ({'commanded prefix' if step <= record['execute_horizon'] else 'not executed in this chunk'}). "
             f"Gripper: left {'open' if grip[0] else 'closed'}, right {'open' if grip[1] else 'closed'}.\n\n"
@@ -407,14 +411,14 @@ class LiveViewer:
             if record is None or self._closed:
                 return
             self._clear(self._nodes)
-            selected_cloud = record["clouds"][int(self.history_frame.value)]
-            local = int(self.history_frame.value)
+            selected_cloud = record["clouds"][min(int(self.history_frame.value), self.history_frames - 1)]
+            local = min(int(self.history_frame.value), self.history_frames - 1)
             self.rgb.image = tcp_overlay(
                 selected_cloud["rgb"], selected_cloud["intrinsics"], selected_cloud["camera_from_world"],
                 measured=record["measured"][local, :, :3, 3] if self.measured.value else None,
-                future=record["future"][int(self.step.value) - 1, :, :3, 3] if self.future.value else None,
+                future=record["future"][min(int(self.step.value), self.prediction_horizon) - 1, :, :3, 3] if self.future.value else None,
                 recovered=record["recovered"][local] if self.recovered.value else None,
-                future_step=int(self.step.value))
+                future_step=min(int(self.step.value), self.prediction_horizon))
             if self.cloud.value and len(selected_cloud["points"]):
                 self._nodes.append(self.server.scene.add_point_cloud("/cloud", points=selected_cloud["points"],
                     colors=selected_cloud["colors"], point_size=float(self.point_size.value),
@@ -429,7 +433,7 @@ class LiveViewer:
                 positions = np.concatenate((record["measured"][-1:, :, :3, 3], record["future"][..., :3, 3]))
                 self._trajectory("future", positions, ARM_COLORS, 2, self._nodes, point_size=0.005)
                 self._trajectory("commanded", positions[:record["execute_horizon"] + 1], ARM_COLORS, 6, self._nodes)
-                selected = record["future"][int(self.step.value) - 1]
+                selected = record["future"][min(int(self.step.value), self.prediction_horizon) - 1]
                 self._trajectory("selected", selected[None, :, :3, 3], ARM_COLORS, 1, self._nodes, point_size=0.015)
                 if self.axes.value:
                     for arm in range(2):
@@ -442,7 +446,7 @@ class LiveViewer:
             record = self._selected()
             if record is None:
                 return
-            pose = record["clouds"][int(self.history_frame.value)]["camera_to_world"]
+            pose = record["clouds"][min(int(self.history_frame.value), self.history_frames - 1)]["camera_to_world"]
             clients = [client] if client is not None else list(self.server.get_clients().values())
             for target in clients:
                 target.camera.position = pose[:3, 3] - 0.2 * pose[:3, 2]

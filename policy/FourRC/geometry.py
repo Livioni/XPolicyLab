@@ -69,28 +69,29 @@ def project_queries(positions, intrinsics, *, clip=False):
     return np.clip(uv, [0, 0], [319, 239]).astype(np.float32)
 
 
-def validate_execute_horizon(value):
+def validate_execute_horizon(value, prediction_horizon=None):
     if isinstance(value, str) and value.strip().isdigit():
         value = int(value.strip())
     if (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
-            or not 1 <= value <= 16):
-        raise ValueError("execute_horizon must be an integer from 1 to 16")
+            or value < 1 or (prediction_horizon is not None and value > prediction_horizon)):
+        limit = f" from 1 to {prediction_horizon}" if prediction_horizon is not None else " greater than zero"
+        raise ValueError(f"execute_horizon must be an integer{limit}")
     return int(value)
 
 
-def convert_actions(prediction, camera_from_world, world_from_base, offsets, *, execute_horizon=8):
-    execute_horizon = validate_execute_horizon(execute_horizon)
+def convert_actions(prediction, camera_from_world, world_from_base, offsets, *, prediction_horizon, execute_horizon=8):
+    execute_horizon = validate_execute_horizon(execute_horizon, prediction_horizon)
     positions = np.asarray(prediction["action_position"], dtype=np.float64)
     rotations = np.asarray(prediction["action_rotation"], dtype=np.float64)
     grip = np.asarray(prediction["action_gripper"])
-    if (positions.shape != (16, 2, 3) or rotations.shape != (16, 2, 3, 3)
-            or grip.shape != (16, 2) or not np.isin(grip, [0, 1]).all()
+    if (positions.shape != (prediction_horizon, 2, 3) or rotations.shape != (prediction_horizon, 2, 3, 3)
+            or grip.shape != (prediction_horizon, 2) or not np.isin(grip, [0, 1]).all()
             or not np.isfinite(positions).all() or not np.isfinite(rotations).all()):
         raise ValueError("Invalid FourRC action prediction")
     if (not np.allclose(rotations.swapaxes(-1, -2) @ rotations, np.eye(3), atol=1e-3)
             or not np.allclose(np.linalg.det(rotations), 1, atol=1e-3)):
         raise ValueError("Invalid predicted TCP rotation")
-    camera_tcp = np.broadcast_to(np.eye(4), (16, 2, 4, 4)).copy()
+    camera_tcp = np.broadcast_to(np.eye(4), (prediction_horizon, 2, 4, 4)).copy()
     camera_tcp[..., :3, :3] = rotations
     camera_tcp[..., :3, 3] = positions
     base_tcp = np.linalg.inv(world_from_base) @ np.linalg.inv(camera_from_world) @ camera_tcp

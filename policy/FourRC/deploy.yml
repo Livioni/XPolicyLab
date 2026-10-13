@@ -17,8 +17,9 @@ device: auto
 dtype: auto
 sampling_steps: 8
 
-# Number of predicted actions executed before replanning (1..16).
-execute_horizon: 8
+# History and prediction lengths come from the wrist Stage2 checkpoint (default 4/40).
+# Number of predicted actions executed before replanning (1..prediction_horizon).
+execute_horizon: 16
 
 # Live point cloud + predicted/actual TCP display on the policy-server host.
 viser: false
