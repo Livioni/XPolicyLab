@@ -3,7 +3,8 @@
 Eval-only adapter for the current local `4RC/stage2_sliding_window_inference.py` API.
 Training and data conversion remain in 4RC. Supported robot: **aloha-agilex**, profile
 **arx_x5**, action type **ee**. One environment per policy server; `eval_batch` is unsupported.
-Only wrist-conditioned, 3072-channel concat, quantile-v1 Stage2 checkpoints are accepted.
+Only wrist-conditioned, 3072-channel concat, **FiLM + componentwise-v2** Stage2
+checkpoints from the current `train_4rc_stage2.py` are accepted.
 
 ## Installation and model assets
 
@@ -19,10 +20,10 @@ The upstream source defaults to the sibling `4RC/`; override it with `FOURRC_ROO
 The policy server also needs RoboTwin aloha-agilex URDF assets and `convert_robotwin_tcp.py`
 for the training-label TCP definition and measured-joint FK.
 
-The default checkpoint is:
+Pass the checkpoint directory explicitly with `--checkpoint PATH`. Its layout is:
 
 ```text
-checkpoints/4rc-stage2-action-clean-qity-1-task-wrist-40chunk/checkpoint-10000/
+<current-stage2-checkpoint>/
   config.json
   action_norm.json
   model.safetensors
@@ -30,12 +31,19 @@ checkpoints/4rc-stage2-action-clean-qity-1-task-wrist-40chunk/checkpoint-10000/
 
 All three files are required to start a local server. The configuration must specify
 `training_stage: 2`, metric geometry, `use_wrist_condition: true`, a saved
-`wrist_encoder_config`, and quantile action normalization version 1. Weights must
+`wrist_encoder_config`, `language_conditioning: film`,
+`action_normalization: componentwise`, and `action_normalization_version: 2`.
+`action_norm.json` must also declare `method: componentwise` and `version: 2`.
+Weights must
 contain the concat global projection with 3072 input channels and the complete
 wrist branch. The upstream loader restores frozen DINOv2 weights from the checkpoint,
 so no separate wrist-model download is needed. Its strict loader checks all weights
-and verifies that `action_q01` / `action_q99` exactly match `action_norm.json`.
-No old-model fallback or weight conversion is provided.
+and verifies that `action_offset` / `action_scale` exactly match `action_norm.json`.
+Old cross-attention / quantile-v1 weights are unsupported. Start a new FiLM +
+componentwise-v2 run from Stage1; editing an old checkpoint's metadata cannot
+make its weights compatible. The previous local `checkpoint-10000` and
+`checkpoint-20000` under `4rc-stage2-action-clean-qity-1-task-wrist-40chunk`
+are v1 checkpoints and are rejected. There is no implicit checkpoint fallback.
 
 T5 defaults to `google-t5/t5-base`; `FOURRC_T5_MODEL` overrides it with a model ID
 or local Transformers directory. Cached T5 assets can be used with
@@ -44,28 +52,32 @@ or local Transformers directory. Cached T5 assets can be used with
 ## Evaluation
 
 ```bash
+# Set this to a complete checkpoint from a new wrist-conditioned Stage2 run:
+CHECKPOINT=/absolute/path/to/current-stage2-checkpoint
 # Validate metadata and the schedule without loading weights or starting processes:
-bash scripts/eval_4rc.sh --dry-run
-# Default checkpoint: 4 history frames, 40 predictions, execute the first 8:
-bash scripts/eval_4rc.sh --task adjust_bottle --test-num 2
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --dry-run
+# Execute 16 predictions before replanning (deploy.yml default; requires H >= 16):
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --task adjust_bottle --test-num 2
 # More frequent replanning:
-bash scripts/eval_4rc.sh --task adjust_bottle --test-num 2 --execute-horizon 4
-# Execute a full predicted chunk:
-bash scripts/eval_4rc.sh --task adjust_bottle --test-num 1 --execute-horizon 40
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --task adjust_bottle --test-num 2 --execute-horizon 4
+# Execute a full chunk for a checkpoint with H=16:
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --task adjust_bottle --test-num 1 --execute-horizon 16
 # Manual inference and geometry viewer:
-bash scripts/eval_4rc.sh --task adjust_bottle --test-num 1 --viser -- --stream-output
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --task adjust_bottle --test-num 1 --viser -- --stream-output
 # Task scheduling, with one independent server per GPU:
-bash scripts/eval_4rc.sh --config scripts/eval_4rc_tasks.yml --gpu-ids 0,1 --test-num 100
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --config scripts/eval_4rc_tasks.yml --gpu-ids 0,1 --test-num 100
+# Both clean/random settings, executing 8 actions per window:
+bash scripts/eval_4rc_batch.sh --checkpoint "$CHECKPOINT" --gpu-ids 0,1
 ```
 
-Use `--checkpoint PATH` for another current wrist-conditioned checkpoint.
+`--checkpoint PATH` is required for every launcher invocation.
 Relative checkpoint paths resolve against the RoboTwin root. History length K and
 prediction horizon H come from the checkpoint, with no fixed 4/40 requirement.
-Execution length N defaults to 8 and must be in **1..H**. `--execute-horizon` sets
+Execution length N defaults to 16 in `deploy.yml` and must be in **1..H**.
+For a shorter checkpoint horizon, pass a smaller N. `--execute-horizon` sets
 `FOURRC_EXECUTE_HORIZON`, overriding `deploy.yml`. `sampling_steps: 8` is the flow
 integration count, independent of N. Restart the server after configuration changes.
-The default checkpoint was trained only on `adjust_bottle`; evaluating other tasks
-uses the same interface but does not imply those tasks were trained.
+Choose evaluation tasks covered by your checkpoint's training task list.
 
 The launcher supports clean/random settings and overrides for the policy and
 simulator conda environments. `ROBOTWIN_RT_DENOISER` defaults to `optix` here.
@@ -111,8 +123,8 @@ behind-camera queries fail. Subsequent historical projections are reconstructed 
 
 Bootstrap repeats the first observation K times. After each executed waypoint the
 evaluator sends one observation, including the terminal observation. The next window
-retains the latest K frames; no boundary observation is duplicated. With the default
-K=4, N=8, windows use `[0,0,0,0]`, then `[5,6,7,8]`, then `[13,14,15,16]`.
+retains the latest K frames; no boundary observation is duplicated. For example,
+with K=4, N=8, windows use `[0,0,0,0]`, then `[5,6,7,8]`, then `[13,14,15,16]`.
 Their wrist inputs come from waypoint 0, 8 and 16 respectively. Reset clears all history.
 
 The model predicts H ordered, absolute TCP poses in the last historical camera frame.
@@ -121,8 +133,12 @@ It conditions on step indices, not timestamps or an execution frequency.
 with the planner trajectory. Collection `save_freq: 15` is a physics-step stride,
 not a 15 Hz control rate.
 
-The upstream model quantile-unnormalizes the full 20-dimensional action vector
-before decoding xyz, rotation6d and gripper score. The adapter receives metric TCP
+The upstream model applies `action * scale + offset` to the 20-dimensional action
+vector before decoding xyz, rotation6d and gripper score. Only each arm's XYZ uses
+fitted offset/scale: q01/q99 midpoint and half span, falling back to min/max for
+spans below `1e-4 m`, with a final span floor of `1e-3 m`. Values are not clipped.
+Rotation6D and signed gripper scores always use offset=0 and scale=1; their
+statistics slots are unused zero placeholders. The adapter receives metric TCP
 positions and rotation matrices, so it never applies another unnormalize.
 Gripper score ≥0 means open; returned grippers are binary 1=open, 0=closed.
 
@@ -183,13 +199,13 @@ On the policy host, from its RoboTwin root:
 
 ```bash
 FOURRC_EXECUTE_HORIZON=8 bash XPolicyLab/policy/FourRC/setup_eval_policy_server.sh \
-  RoboTwin adjust_bottle /absolute/path/to/wrist/checkpoint arx_x5 ee 0 0 4rc 18080 0.0.0.0
+  RoboTwin adjust_bottle /absolute/path/to/current-stage2-checkpoint arx_x5 ee 0 0 4rc 18080 0.0.0.0
 ```
 
 On the simulator host, keep checkpoint metadata available locally and connect:
 
 ```bash
-bash scripts/eval_4rc.sh --task adjust_bottle --test-num 2 -- \
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --task adjust_bottle --test-num 2 -- \
   --enable-remote --policy-server-ip SERVER_IP --policy-server-port 18080
 ```
 
@@ -203,13 +219,12 @@ Do not interleave simultaneous environments on one stateful server.
 
 ```bash
 conda run -n 4rc python -m pytest XPolicyLab/policy/FourRC/tests -q
-bash scripts/eval_4rc.sh --dry-run
+bash scripts/eval_4rc.sh --checkpoint "$CHECKPOINT" --dry-run
 ```
 
-Tests cover wrist frame selection and RGB ranges, variable K/H/N, quantile checkpoint
-requirements, strict model loading boundaries, measured-joint query initialization,
-coordinate transforms, three-camera WebSocket transport, terminal observations,
-viewer ranges and manual gating. The generic demo debug client lacks the calibrated
+Tests cover the FiLM/componentwise-v2 checkpoint contract, legacy rejection,
+normalization metadata consistency, and the adapter's loading and sliding-window
+inference boundary. The generic demo debug client lacks the calibrated
 third-camera/root metadata: use the calibrated transport tests rather than relaxing
-the adapter contract. Real model/simulator smoke testing requires complete weights
+the adapter contract. Real model/simulator smoke testing requires current weights
 and a usable GPU; dry-run and fake-policy tests do not establish task success rates.

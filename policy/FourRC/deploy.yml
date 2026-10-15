@@ -17,7 +17,8 @@ device: auto
 dtype: auto
 sampling_steps: 8
 
-# History and prediction lengths come from the wrist Stage2 checkpoint (default 4/40).
+# Requires a wrist FiLM + componentwise-v2 Stage2 checkpoint via ckpt_name.
+# History and prediction lengths come from that checkpoint (training defaults 8/16).
 # Number of predicted actions executed before replanning (1..prediction_horizon).
 execute_horizon: 16
 

@@ -15,7 +15,7 @@ from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
 from XPolicyLab.utils.process_data import get_robot_action_dim_info
 from .geometry import (rigid, AlohaKinematics, project_queries,
                        convert_actions, validate_execute_horizon)
-from .checkpoint import DEFAULT_CHECKPOINT, read_config
+from .checkpoint import read_config
 
 
 class Model(ModelTemplate):
@@ -32,20 +32,17 @@ class Model(ModelTemplate):
             raise ValueError("FourRC requires two six-joint arms and two scalar grippers")
         xpl_root = Path(__file__).resolve().parents[2]
         self.robotwin_root = xpl_root.parent
+        self.checkpoint = resolve_checkpoint_root(self.cfg, self.robotwin_root / "checkpoints", policy_dir=self.robotwin_root)
+        config = read_config(self.checkpoint)
+        self.history_frames = config["history_frames"]
+        self.prediction_horizon = config["prediction_horizon"]
+        self.execute_horizon = validate_execute_horizon(self.execute_horizon, self.prediction_horizon)
         upstream = Path(os.environ.get("FOURRC_ROOT") or self.cfg.get("fourrc_root")
                         or self.robotwin_root.parent / "4RC").expanduser().resolve()
         if not (upstream / "stage2_sliding_window_inference.py").is_file():
             raise FileNotFoundError(f"4RC source missing at {upstream}; set FOURRC_ROOT")
         sys.path.insert(0, str(upstream))
         self.inference = importlib.import_module("stage2_sliding_window_inference")
-        ckpt_cfg = dict(self.cfg)
-        if not ckpt_cfg.get("ckpt_name"):
-            ckpt_cfg["ckpt_name"] = str(self.robotwin_root / DEFAULT_CHECKPOINT)
-        self.checkpoint = resolve_checkpoint_root(ckpt_cfg, self.robotwin_root / "checkpoints", policy_dir=self.robotwin_root)
-        config = read_config(self.checkpoint)
-        self.history_frames = config["history_frames"]
-        self.prediction_horizon = config["prediction_horizon"]
-        self.execute_horizon = validate_execute_horizon(self.execute_horizon, self.prediction_horizon)
         # Reject the old cross-frame-only projection before constructing the model.
         from safetensors import safe_open
         with safe_open(str(self.checkpoint / "model.safetensors"), framework="pt", device="cpu") as weights:
@@ -75,7 +72,9 @@ class Model(ModelTemplate):
         self.reset()
         self._log({"event": "loaded", "checkpoint": str(self.checkpoint), "history": self.history_frames,
                    "horizon": self.prediction_horizon, "execute": self.execute_horizon, "time_encoding": "index",
-                   "use_wrist_condition": True, "action_normalization": "quantile", "action_normalization_version": 1,
+                   "use_wrist_condition": True, "language_conditioning": config["language_conditioning"],
+                   "action_normalization": config["action_normalization"],
+                   "action_normalization_version": config["action_normalization_version"],
                    "global_feature_mode": self.global_feature_mode,
                    "global_visual_input_dim": self.global_visual_input_dim,
                    "timing": "ordered action steps; RoboTwin waypoint execution is variable-duration",
