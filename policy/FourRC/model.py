@@ -1,4 +1,5 @@
-"""Wrist-conditioned 4RC Stage2 evaluation with checkpoint-defined windows."""
+"""4RC V2 Stage2 evaluation with real robot state and RGB conditions."""
+from collections import deque
 import importlib
 import json
 import os
@@ -43,23 +44,13 @@ class Model(ModelTemplate):
             raise FileNotFoundError(f"4RC source missing at {upstream}; set FOURRC_ROOT")
         sys.path.insert(0, str(upstream))
         self.inference = importlib.import_module("stage2_sliding_window_inference")
-        # Reject the old cross-frame-only projection before constructing the model.
-        from safetensors import safe_open
-        with safe_open(str(self.checkpoint / "model.safetensors"), framework="pt", device="cpu") as weights:
-            key = "global_encoder.projection.1.weight"
-            if key not in weights.keys() or weights.get_slice(key).get_shape() != [config["action_dim"], 3072]:
-                raise ValueError("FourRC requires the 3072-channel concat global visual encoder")
         self.device, self.dtype = self.inference.resolve_device_dtype(
             self.cfg.get("device", "auto"), self.cfg.get("dtype", "auto"))
         self.policy, self.training_cfg = self.inference.load_stage2_policy(
             self.checkpoint, self.device, t5_model=os.environ.get("FOURRC_T5_MODEL") or self.cfg.get("t5_model"))
-        self.global_feature_mode = self.policy.global_feature_mode
-        self.global_visual_input_dim = self.policy.global_encoder.projection[1].in_features
-        print(f"[FourRC] checkpoint global_feature_mode={self.global_feature_mode}, "
-              f"global_visual_input_dim={self.global_visual_input_dim}", flush=True)
-        if not self.policy.use_wrist_condition or self.policy.global_feature_mode != "concat":
-            raise ValueError("FourRC requires a wrist-conditioned concat Stage2 policy")
-        self.sampling_steps = int(self.cfg.get("sampling_steps") or self.training_cfg.get("sampling_steps", 8))
+        self.sampling_steps = int(self.cfg.get("sampling_steps") or self.training_cfg["sampling_steps"])
+        if self.sampling_steps < 1:
+            raise ValueError("FourRC sampling_steps must be positive")
         self.kinematics = AlohaKinematics(self.robotwin_root)
         self.offsets = self.kinematics.offsets
         self.case = {}
@@ -72,11 +63,10 @@ class Model(ModelTemplate):
         self.reset()
         self._log({"event": "loaded", "checkpoint": str(self.checkpoint), "history": self.history_frames,
                    "horizon": self.prediction_horizon, "execute": self.execute_horizon, "time_encoding": "index",
-                   "use_wrist_condition": True, "language_conditioning": config["language_conditioning"],
+                   "action_head_type": config["action_head_type"],
+                   "state_normalization_version": config["state_normalization_version"],
                    "action_normalization": config["action_normalization"],
                    "action_normalization_version": config["action_normalization_version"],
-                   "global_feature_mode": self.global_feature_mode,
-                   "global_visual_input_dim": self.global_visual_input_dim,
                    "timing": "ordered action steps; RoboTwin waypoint execution is variable-duration",
                    "initial_query": "measured_joint_fk", "frame": "robot_base",
                    "viser_url": self.viewer.url if self.viewer is not None else None})
@@ -109,18 +99,18 @@ class Model(ModelTemplate):
     def inference_ready(self):
         if getattr(self, "_manual_viewer_error", None):
             raise RuntimeError(f"Manual inference UI failed: {self._manual_viewer_error}")
+        if not self.observation_history:
+            return False
         viewer = getattr(self, "viewer", None)
         if viewer is None:
             return True
-        expected = 1 if self.previous is None else self.execute_horizon
-        return len(self.pending) == expected and viewer.inference_ready()
+        return viewer.inference_ready()
 
     def prepare_case(self, case_meta=None):
         self.case = dict(case_meta or {})
 
     def reset(self):
-        self.pending = []
-        self.previous = None
+        self.observation_history = deque(maxlen=self.history_frames)
         self.observation_count = 0
         self.window = 0
         self.env_idx = None
@@ -158,8 +148,6 @@ class Model(ModelTemplate):
         if self.instruction is not None and text != self.instruction:
             raise ValueError("Instruction changed without episode reset")
         self.instruction = text
-        if len(self.pending) >= (1 if self.previous is None else self.execute_horizon):
-            raise ValueError("Unexpected observation count before inference")
         index = info.get("waypoint_index")
         if (isinstance(index, bool) or not isinstance(index, (int, np.integer))
                 or index != self.observation_count):
@@ -169,13 +157,25 @@ class Model(ModelTemplate):
                                for side in ("left", "right")])
         except KeyError as exc:
             raise ValueError("FourRC requires measured left/right arm joint states for FK queries") from exc
+        if joints.shape != (2, 6) or not np.isfinite(joints).all():
+            raise ValueError("FourRC measured arm joints must be finite [2,6]")
+        try:
+            grippers = np.stack([np.asarray(obs["state"][f"{side}_ee_joint_state"], dtype=np.float32)
+                                 for side in ("left", "right")])
+        except KeyError as exc:
+            raise ValueError("FourRC requires current left/right gripper states") from exc
+        if (grippers.shape != (2, 1) or not np.isfinite(grippers).all()
+                or np.any((grippers < 0) | (grippers > 1))):
+            raise ValueError("FourRC current gripper states must be finite [2,1] in [0,1]")
+        robot_state = np.concatenate((joints, grippers), axis=1).astype(np.float32).reshape(14)
         tcp_base = self.kinematics.tcp_base(joints)
         frame = {"rgb": rgb.copy(), "wrist_rgb": np.stack(wrists), "k": k.copy(),
                  "cw": rigid(camera["extrinsics_matrix"], "third camera extrinsics"),
                  "wb": rigid(info["T_world_from_robot_base"], "robot root pose"),
                  "index": int(index), "joints": joints.copy(), "tcp_base": tcp_base,
+                 "robot_state": robot_state,
                  "terminal": bool(info.get("episode_end", False))}
-        self.pending.append(frame)
+        self.observation_history.append(frame)
         self.observation_count += 1
         self._visualize("observe", frame)
 
@@ -198,9 +198,8 @@ class Model(ModelTemplate):
             raise
 
     def _get_action(self):
-        expected = 1 if self.previous is None else self.execute_horizon
-        if len(self.pending) != expected:
-            raise ValueError(f"Expected {expected} new observations, got {len(self.pending)}")
+        if not self.observation_history:
+            raise RuntimeError("get_action() called before update_obs().")
         if getattr(self, "_manual_viewer_error", None):
             raise RuntimeError(f"Manual inference UI failed: {self._manual_viewer_error}")
         viewer = getattr(self, "viewer", None)
@@ -209,10 +208,9 @@ class Model(ModelTemplate):
                 viewer.begin_inference()
             else:
                 self._visualize("begin_inference")
-        if self.previous is None:
-            frames = self.pending * self.history_frames
-        else:
-            frames = (self.previous + self.pending)[-self.history_frames:]
+        # Match DP's latest-K observation stack, left-padded with the oldest frame.
+        frames = list(self.observation_history)
+        frames = [frames[0]] * (self.history_frames - len(frames)) + frames
         # Initial queries belong to the FIRST historical RGB, not the latest pose.
         first = frames[0]
         camera_tcp = first["cw"] @ first["wb"] @ first["tcp_base"]
@@ -227,6 +225,7 @@ class Model(ModelTemplate):
         prediction = self.inference.infer_stage2_window(
             self.policy, images, intrinsics, query_tensor, self.instruction,
             steps=self.sampling_steps, seed=seed, device=self.device, dtype=self.dtype,
+            current_robot_state=torch.from_numpy(anchor["robot_state"]).unsqueeze(0),
             wrist_images=wrist_images)
         if not prediction["success"]:
             raise RuntimeError("FourRC reported prediction failure")
@@ -238,6 +237,7 @@ class Model(ModelTemplate):
                    "anchor": anchor["index"], "execute": self.execute_horizon,
                    "history": self.history_frames, "horizon": self.prediction_horizon,
                    "wrist_waypoint_index": anchor["index"],
+                   "current_robot_state": anchor["robot_state"].tolist(),
                    "history_indices": [frame["index"] for frame in frames],
                    "future_step_indices": prediction["future_step_indices"].tolist(),
                    "query_pixels": queries.tolist(), "query_source": "measured_joint_fk",
@@ -249,8 +249,6 @@ class Model(ModelTemplate):
         self._visualize("publish", frames, prediction, base_tcp,
                         case=self.case, instruction=self.instruction, window=self.window,
                         execute_horizon=self.execute_horizon)
-        self.previous = frames
-        self.pending = []
         self.window += 1
         return chunk
 

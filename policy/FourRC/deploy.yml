@@ -15,10 +15,10 @@ fourrc_root: null
 t5_model: google-t5/t5-base
 device: auto
 dtype: auto
-sampling_steps: 8
+sampling_steps: null  # Use the checkpoint sampling_steps (current training default: 4).
 
-# Requires a wrist FiLM + componentwise-v2 Stage2 checkpoint via ckpt_name.
-# History and prediction lengths come from that checkpoint (training defaults 8/16).
+# Requires a groot_tcp_v1 + componentwise-v2 + state-v1 Stage2 checkpoint via ckpt_name.
+# History and prediction lengths come from that checkpoint (training defaults 4/32).
 # Number of predicted actions executed before replanning (1..prediction_horizon).
 execute_horizon: 16
 

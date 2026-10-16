@@ -1,6 +1,6 @@
 # 4RC Stage2 训练 / RoboTwin 评测核查（2026-09-21）
 
-> 当前评测只接受 `FiLM + componentwise v2`、3072 维 concat、带腕部输入的 Stage2 权重。
+> 当前评测只接受 `groot_tcp_v1` V2 Stage2 权重，并要求真实 14 维状态及 `state_norm.json`。
 > 本文是旧版 checkpoint 的历史实验记录；当前接口与运行命令见 [README.md](README.md)。
 
 > 历史记录：本文指标对应当时的“默认初始姿态 + 重建 query 传播”实现。后续已按用户要求改为每个窗口使用首帧实测关节 FK 初始化 query，并按 waypoint 归档观测；当前行为见 [README](README.md)。 2026-09-25 已适配上游 `f053eed`：Stage2 使用离散步索引且训练包含首帧重复填充，本文关于物理时间条件和训练不含静态首窗口的描述仅适用于旧版。

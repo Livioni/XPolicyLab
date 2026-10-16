@@ -23,6 +23,16 @@ yaml_file="${XPL_ROOT}/policy/${policy_name}/deploy.yml"
 
 echo "[CLIENT] policy=${policy_name}, task=${task_name}, server=${policy_server_ip}:${policy_server_port}"
 
+# Supply calibrated cameras for both the standard local and remote entry points.
+# Scheduler arguments follow the default so explicit task_config values win.
+fourrc_eval_args_file="$(mktemp /tmp/fourrc-eval-args-XXXXXX)"
+trap 'rm -f "$fourrc_eval_args_file"' EXIT
+printf '%s\n' --task_config 4rc_clean > "$fourrc_eval_args_file"
+if [[ -n "${ROBOTWIN_EVAL_ARGS_FILE:-}" ]]; then
+    cat -- "$ROBOTWIN_EVAL_ARGS_FILE" >> "$fourrc_eval_args_file"
+fi
+export ROBOTWIN_EVAL_ARGS_FILE="$fourrc_eval_args_file"
+
 bash "${UTILS_DIR}/setup_env_client.sh" \
     "${UTILS_DIR}" \
     "${yaml_file}" \
